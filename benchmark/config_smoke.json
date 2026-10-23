@@ -1,0 +1,8 @@
+
+{
+  "input_tokens": [128, 512],
+  "concurrency": [1, 4],
+  "requests_per_run": 8,
+  "max_output_tokens": 64,
+  "repeats": 1
+}

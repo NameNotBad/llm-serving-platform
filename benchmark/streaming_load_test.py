@@ -7,6 +7,10 @@ import time
 import httpx
 import numpy as np
 
+import json
+from pathlib import Path
+
+from prompt_generator import generate_token_length_prompts
 
 URL = "http://127.0.0.1:8000/v1/chat/completions"
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -37,8 +41,7 @@ def make_payload(prompt, max_tokens):
     }
 
 
-async def send_request(client, semaphore, request_id, max_tokens):
-    prompt = PROMPTS[request_id % len(PROMPTS)]
+async def send_request(client, semaphore, request_id, max_tokens, prompt):
     payload = make_payload(prompt, max_tokens)
 
     async with semaphore:
@@ -46,6 +49,7 @@ async def send_request(client, semaphore, request_id, max_tokens):
         first_token_time = None
         last_token_time = None
         output_tokens = None
+        input_tokens = None
         content_chunks = 0
 
         async with client.stream(
@@ -65,7 +69,9 @@ async def send_request(client, semaphore, request_id, max_tokens):
                 event = json.loads(data)
 
                 if event.get("usage") is not None:
-                    output_tokens = event["usage"]["completion_tokens"]
+                    usage = event["usage"]
+                    output_tokens = usage["completion_tokens"]
+                    input_tokens = usage["prompt_tokens"]
 
                 for choice in event.get("choices", []):
                     content = choice.get("delta", {}).get("content")
@@ -81,37 +87,57 @@ async def send_request(client, semaphore, request_id, max_tokens):
 
         end = time.perf_counter()
 
-        if first_token_time is None:
-            raise RuntimeError(
-                f"Request {request_id} returned no content"
-            )
+        
+    if first_token_time is None:
+        raise RuntimeError(
+            f"Request {request_id} returned no content"
+        )
 
-        if output_tokens is None:
-            raise RuntimeError(
-                f"Request {request_id} returned no usage"
-            )
+    if output_tokens is None:
+        raise RuntimeError(
+            f"Request {request_id} returned no usage"
+        )
 
-        ttft = first_token_time - start
-        e2e = end - start
+    # 新增：检查是否收到了输入 Token 数量
+    if input_tokens is None:
+        raise RuntimeError(
+            f"Request {request_id} returned no prompt token usage"
+        )
 
-        tpot = None
-        if output_tokens > 1:
-            tpot = (
-                last_token_time - first_token_time
-            ) / (output_tokens - 1)
+    ttft = first_token_time - start
+    e2e = end - start
 
-        return {
-            "request_id": request_id,
-            "ttft": ttft,
-            "tpot": tpot,
-            "e2e": e2e,
-            "output_tokens": output_tokens,
-            "content_chunks": content_chunks,
-        }
+    tpot = None
+    if output_tokens > 1:
+        tpot = (
+            last_token_time - first_token_time
+        ) / (output_tokens - 1)
+
+    return {
+        "request_id": request_id,
+        "ttft": ttft,
+        "tpot": tpot,
+        "e2e": e2e,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "content_chunks": content_chunks,
+    }
 
 
-async def benchmark(concurrency, total_requests, max_tokens):
+
+async def benchmark(
+    concurrency,
+    total_requests,
+    max_tokens,
+    input_tokens,
+):
     semaphore = asyncio.Semaphore(concurrency)
+
+    prompts = generate_token_length_prompts(
+        count=total_requests + 1,
+        target_tokens=input_tokens,
+        seed=42,
+    )
 
     limits = httpx.Limits(
         max_connections=concurrency,
@@ -127,8 +153,9 @@ async def benchmark(concurrency, total_requests, max_tokens):
         await send_request(
             client,
             semaphore,
-            request_id=0,
+            request_id=-1,
             max_tokens=max_tokens,
+            prompt=prompts[-1],
         )
 
         start = time.perf_counter()
@@ -139,6 +166,7 @@ async def benchmark(concurrency, total_requests, max_tokens):
                 semaphore,
                 request_id=i,
                 max_tokens=max_tokens,
+                prompt=prompts[i],
             )
             for i in range(total_requests)
         ]
@@ -180,6 +208,7 @@ async def benchmark(concurrency, total_requests, max_tokens):
     print(f"P50:  {np.percentile(e2es, 50) * 1000:.2f} ms")
     print(f"P95:  {np.percentile(e2es, 95) * 1000:.2f} ms")
 
+    
     print("\n--- Per-Request ---")
     for r in results:
         tpot_ms = (
@@ -193,8 +222,39 @@ async def benchmark(concurrency, total_requests, max_tokens):
             f"TTFT={r['ttft'] * 1000:.1f}ms | "
             f"TPOT={tpot_ms}ms | "
             f"E2E={r['e2e'] * 1000:.1f}ms | "
-            f"Tokens={r['output_tokens']}"
+            f"Input={r['input_tokens']} | "
+            f"Output={r['output_tokens']}"
         )
+    
+    return {
+        "config": {
+            "concurrency": concurrency,
+            "total_requests": total_requests,
+            "max_output_tokens": max_tokens,
+            "input_tokens": input_tokens,
+        },
+        "summary": {
+            "total_output_tokens": total_tokens,
+            "duration_s": elapsed,
+            "throughput_tps": total_tokens / elapsed,
+            "requests_per_sec": total_requests / elapsed,
+            "ttft_mean_ms": float(np.mean(ttfts) * 1000),
+            "ttft_p95_ms": float(np.percentile(ttfts, 95) * 1000),
+            "tpot_mean_ms": (
+                float(np.mean(tpots) * 1000)
+                if len(tpots) > 0 else None
+            ),
+            "tpot_p95_ms": (
+                float(np.percentile(tpots, 95) * 1000)
+                if len(tpots) > 0 else None
+            ),
+            "e2e_mean_ms": float(np.mean(e2es) * 1000),
+            "e2e_p95_ms": float(np.percentile(e2es, 95) * 1000),
+        },
+        "requests": results,
+    }
+
+
 
 
 if __name__ == "__main__":
@@ -209,6 +269,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-tokens", type=int, default=64
     )
+    parser.add_argument(
+        "--input-tokens",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+    "--output-json",
+    type=str,
+    default=None,
+)
 
     args = parser.parse_args()
 
@@ -216,13 +286,29 @@ if __name__ == "__main__":
         args.concurrency < 1
         or args.requests < 1
         or args.max_tokens < 1
+        or args.input_tokens < 1
     ):
         parser.error("All parameters must be positive")
 
-    asyncio.run(
+    
+    report = asyncio.run(
         benchmark(
             args.concurrency,
             args.requests,
             args.max_tokens,
+            args.input_tokens,
         )
     )
+
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(report, file, indent=2)
+
+        print(f"\nJSON report saved: {output_path}")
+

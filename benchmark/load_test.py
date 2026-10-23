@@ -6,22 +6,31 @@ import time
 import httpx
 import numpy as np
 
-PROMPT = "Explain KV cache in Transformer inference in two sentences."
+PROMPTS = [
+    "Explain KV cache in Transformer inference.",
+    "Explain the difference between prefill and decode in LLM inference.",
+    "What is continuous batching and why does it improve throughput?",
+    "Explain how PagedAttention manages GPU memory.",
+    "What causes high time-to-first-token latency?",
+    "Explain the trade-off between throughput and latency.",
+    "How does tensor parallelism work in large language models?",
+    "What is the difference between quantization and pruning?",
+]
 
 HF_URL = "http://127.0.0.1:8000/generate"
 VLLM_URL = "http://127.0.0.1:8000/v1/chat/completions"
 
 
-def build_request(backend):
+def build_request(backend, prompt):
     if backend == "hf":
         return HF_URL, {
-            "prompt": PROMPT,
+            "prompt": prompt,
             "max_new_tokens": 64,
         }
 
     return VLLM_URL, {
         "model": "Qwen/Qwen2.5-1.5B-Instruct",
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 64,
         "temperature": 0,
         "repetition_penalty": 1.0,
@@ -30,8 +39,9 @@ def build_request(backend):
     }
 
 
-async def send_request(client, semaphore, backend):
-    url, payload = build_request(backend)
+async def send_request(client, semaphore, backend, request_id):
+    prompt = PROMPTS[request_id % len(PROMPTS)]
+    url, payload = build_request(backend, prompt)
 
     async with semaphore:
         start = time.perf_counter()
@@ -71,7 +81,7 @@ async def send_request(client, semaphore, backend):
 
 async def benchmark(backend, concurrency, total_requests):
     semaphore = asyncio.Semaphore(concurrency)
-    url, payload = build_request(backend)
+    url, payload = build_request(backend, PROMPTS[0])
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         # Warmup is excluded from the measurements.
@@ -81,8 +91,8 @@ async def benchmark(backend, concurrency, total_requests):
         start = time.perf_counter()
 
         tasks = [
-            send_request(client, semaphore, backend)
-            for _ in range(total_requests)
+            send_request(client, semaphore, backend, i)
+            for i in range(total_requests)
         ]
 
         results = await asyncio.gather(*tasks)

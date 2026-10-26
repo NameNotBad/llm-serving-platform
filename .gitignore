@@ -6,3 +6,20 @@ __pycache__/
 .idea/
 *.log
 .env
+# Benchmark outputs
+results/
+
+# NVIDIA installer
+cuda-keyring_*.deb
+
+# Nsight Compute reports
+*.ncu-rep
+*.ncu-repz
+
+# PyTorch GPU traces
+*.pt.trace.json
+*.pt.trace.json.gz
+
+# Python caches
+__pycache__/
+*.pyc

@@ -29,6 +29,8 @@ from pathlib import Path
 
 from aggregate_results import aggregate_results
 
+from environment import collect_environment
+
 # ------------------------------------------------------------
 # Project paths
 # ------------------------------------------------------------
@@ -430,6 +432,23 @@ def main() -> None:
         output_dir / "config.json",
         config,
     )
+
+
+    # Capture the benchmark client's execution environment.
+    # This includes GPU, Git, OS, and Python package versions.
+    environment = collect_environment()
+
+    save_json(
+        output_dir / "environment.json",
+        environment,
+    )
+
+    print(
+        f"Environment metadata saved: "
+        f"{output_dir / 'environment.json'}",
+        flush=True,
+    )
+
 
     # Build every combination of:
     # input length × concurrency × repeat.

@@ -312,8 +312,246 @@ Potential next steps include:
 - Multi-GPU and distributed inference
 - Hardware profiling of representative vLLM kernels
 
+## 11. Production-Oriented API Gateway (Stage 2)
+
+Stage 2 extends the GPU inference platform with a FastAPI
+gateway designed to study LLM serving reliability under
+concurrent workloads.
+
+### Gateway Architecture
+
+```text
+Client / Load Generator
+         |
+         v
+FastAPI Gateway :8080
+    |
+    |-- Admission Control
+    |     |-- Max In-flight: 8
+    |     |-- Max Queue: 16
+    |     |-- Queue Timeout: 5s
+    |
+    |-- Timeout Policies
+    |     |-- Header Timeout: 15s
+    |     |-- Stream Idle Timeout: 15s
+    |     |-- Request Deadline: 120s
+    |
+    |-- Prometheus Metrics
+    |
+    v
+vLLM Backend :8000
+         |
+         v
+Qwen2.5-1.5B-Instruct
+```
+
+The gateway uses a shared HTTPX AsyncClient to forward
+OpenAI-compatible chat completion requests.
+
+Streaming responses preserve upstream SSE data while enforcing
+bounded concurrency, queue capacity, and timeout policies.
+
+### Admission Control and Overload Protection
+
+The gateway supports:
+
+- Bounded concurrent requests
+- Bounded waiting queues
+- HTTP 503 rejection when the queue is full
+- Queue timeout enforcement
+- Streaming lifecycle cleanup
+- Client disconnect handling
+- Upstream connection error handling
+
+In a 32-request concurrent overload experiment:
+
+| Outcome | Requests |
+|---|---:|
+| Successful requests | 16 |
+| Queue-full rejection | 8 |
+| Queue timeout | 8 |
+
+The maximum observed concurrency was 8/8, and maximum observed
+queue depth was 16/16.
+
+All six benchmark invariant checks passed, and both in-flight
+and queued request counts returned to zero after completion.
+
+### Timeout Policies
+
+| Policy | Default |
+|---|---:|
+| Queue timeout | 5 seconds |
+| Upstream header timeout | 15 seconds |
+| Streaming idle timeout | 15 seconds |
+| Request deadline | 120 seconds |
+
+Streaming idle timeout and request deadline were validated
+using mock upstream fault-injection experiments.
+
+The current implementation does not guarantee a strict
+end-to-end deadline in every slow-client scenario.
+
+### Gateway Performance Evaluation
+
+A direct-vLLM versus Gateway A/B benchmark covered:
+
+- 4 concurrency levels: 1, 4, 8, 16
+- 3 repetitions per configuration
+- 32 requests per run
+- 768 measured requests overall
+
+Across the measured configurations, Gateway routing did not
+introduce a consistent, substantial performance regression.
+
+See the Stage 2 report for the full experimental data,
+methodology, and limitations.
+
+## 12. Observability and Monitoring
+
+Stage 2 includes a Prometheus and Grafana monitoring stack.
+
+### Monitoring Architecture
+
+```text
+Gateway :8080/metrics
+          |
+          v
+Prometheus :9090
+          |
+          v
+Grafana :3000
+```
+
+The monitoring stack uses Docker Compose and configuration
+files stored in the repository.
+
+### Available Metrics
+
+| Metric | Type |
+|---|---|
+| gateway_inflight_requests | Gauge |
+| gateway_queued_requests | Gauge |
+| gateway_requests_total | Counter |
+| gateway_request_duration_seconds | Histogram |
+| gateway_queue_wait_seconds | Histogram |
+| gateway_timeouts_total | Counter |
+
+Request duration histograms support result-based filtering
+so successful inference latency can be monitored separately
+from rejected and timed-out requests.
+
+### Grafana Dashboard
+
+The automatically provisioned dashboard includes six panels:
+
+1. Request Throughput (RPS)
+2. Successful Request Latency (P50/P95/P99)
+3. In-flight Requests
+4. Queue Depth
+5. Queue Wait P95
+6. Request Outcomes
+
+Dashboard URL:
+
+http://localhost:3000/d/llm-serving-platform
+
+Prometheus URL:
+
+http://localhost:9090
+
+These URLs are available after starting the monitoring stack
+on the local development machine.
+
+## 13. Running Stage 2
+
+### Start vLLM
+
+```bash
+source ~/venvs/llm-serving-vllm/bin/activate
+
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --dtype float16 \
+  --max-model-len 2048
+```
+
+### Start the Gateway
+
+Open a second terminal:
+
+```bash
+source .venv/bin/activate
+
+python -m pip install -r gateway/requirements.txt
+
+python -m uvicorn gateway.app:app \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+The gateway is unauthenticated and should only be used
+on a trusted development network.
+
+### Start Prometheus and Grafana
+
+Open a third terminal:
+
+```bash
+export WSL_IP=$(hostname -I | awk '{print $1}')
+
+docker compose \
+  -f monitoring/docker-compose.yml \
+  up -d
+```
+
+The Compose configuration maps the current WSL IP to
+`wsl-gateway` for Prometheus scraping.
+
+If WSL networking changes, refresh WSL_IP and recreate
+the monitoring containers.
+
+### Run the Gateway Overload Benchmark
+
+```bash
+python benchmark/gateway_overload_test.py \
+  --requests 32 \
+  --max-tokens 512 \
+  --interval 0.05
+```
+
+Benchmark output is saved under `results/gateway/`.
+
+### Check Service Health
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+
+curl http://127.0.0.1:8080/gateway/status
+
+curl http://127.0.0.1:8080/metrics
+```
+
+## 14. Stage 2 Technical Report
+
+For implementation details, experimental methodology,
+failure injection, metrics validation, and known limitations:
+
+[Stage 2 Technical Report](docs/LLM_SERVING_STAGE2_REPORT.md)
+
+The Stage 2 implementation is a tested local prototype intended
+for learning and demonstrating LLM serving systems engineering.
+It is not a fully production-hardened deployment.
+
 ## Summary
 
-This project demonstrates a reproducible workflow for **LLM serving, performance benchmarking, controlled optimization, GPU profiling, and hardware-level performance investigation**.
+This project explores the design, optimization, and operational reliability of a single-node LLM serving platform.
 
-Its main contribution is not a new inference engine, but an engineering framework for understanding and improving the performance of existing LLM serving systems.
+**Stage 1 — Inference Performance Engineering** focuses on vLLM inference serving, performance benchmarking, prefix caching, prefill/decode workload analysis, and GPU profiling using PyTorch Profiler and NVIDIA Nsight Compute.
+
+**Stage 2 — Gateway Reliability and Observability** extends the platform with a FastAPI streaming gateway, admission control, bounded queueing, timeout policies, request lifecycle management, and Prometheus/Grafana monitoring.
+
+Together, these stages demonstrate practical experience across LLM inference performance, GPU bottleneck analysis, concurrent request handling, overload protection, and production-oriented observability.
+
+The platform has been validated through controlled benchmarks, failure-injection experiments, and monitoring integration tests. It remains a single-node development prototype rather than a fully production-hardened distributed serving system.
